@@ -2,9 +2,11 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypt
 import { mkdirSync } from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
 import { planets } from './star-options';
-import { readPhotoInput } from './star-photos';
+import { decodePhoto, maxStarPhotos, photoTypes, readPhotoInput } from './star-photos';
+import { downloadMemory, hosted, memoryType, newMemoryPath, remote, removeMemories, requirePrivateMemories, uploadMemory } from './supabase';
 
 const summaryFields = 'id,title,author,color,tags,x,y';
+const detailFields = summaryFields + ',note,visibility,created,owner_hash,access_hash,photos';
 const world = { x: 2400, y: 1600 };
 const colors = new Set<string>(['white', 'gold', 'pink', 'lavender', 'blue', ...planets.map((planet) => planet.color)]);
 type Star = {
@@ -45,27 +47,6 @@ function database() {
   });
 }
 
-function hosted() {
-  if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) return true;
-  if (process.env.VERCEL || process.env.SUPABASE_URL || process.env.SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error('Configure both Supabase environment variables.');
-  }
-  return false;
-}
-
-async function remote<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-  const response = await fetch(new URL('/rest/v1/' + path, process.env.SUPABASE_URL), {
-    ...options, cache: 'no-store', headers: {
-      apikey: key, ...(key.startsWith('sb_secret_') ? {} : { Authorization: 'Bearer ' + key }),
-      'Content-Type': 'application/json', ...options.headers
-    }
-  });
-  if (!response.ok) throw new Error('Database request failed with status ' + response.status);
-  const body = await response.text();
-  return (body ? JSON.parse(body) : undefined) as T;
-}
-
 export async function listStars(term: string) {
   if (hosted()) {
     if (term) return remote('rpc/find_public_stars', { method: 'POST', body: JSON.stringify({ term }) });
@@ -82,12 +63,46 @@ const hash = (value: string) => createHash('sha256').update(value).digest('hex')
 const token = () => randomBytes(32).toString('base64url');
 
 function matches(value: string | null, stored: string | null) {
-  return Boolean(value && stored && /^[\w-]{43}$/.test(value) &&
+  return Boolean(value && stored && /^[\w-]{43}$/.test(value) && /^[a-f0-9]{64}$/.test(stored) &&
     timingSafeEqual(Buffer.from(hash(value), 'hex'), Buffer.from(stored, 'hex')));
 }
 
 function textField(input: unknown, max: number, required = false) {
   return typeof input === 'string' && input.length <= max && (!required || Boolean(input.trim()));
+}
+
+export class PhotoUploadError extends Error {}
+
+async function saveHostedStar(star: Star, photos: NonNullable<ReturnType<typeof readPhotoInput>>) {
+  const paths = photos.map((photo) => newMemoryPath(star.id, photo));
+  if (paths.length) {
+    try {
+      await requirePrivateMemories();
+    } catch (error) {
+      throw new PhotoUploadError('Memory storage is unavailable.', { cause: error });
+    }
+    const uploads = await Promise.allSettled(photos.map((photo, index) => uploadMemory(paths[index], photo)));
+    const failed = uploads.find((upload) => upload.status === 'rejected');
+    if (failed) {
+      await removeMemories(paths);
+      throw new PhotoUploadError('A memory could not be uploaded.', { cause: failed.reason });
+    }
+  }
+
+  try {
+    await remote('stars', {
+      method: 'POST',
+      headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ ...star, photos: paths })
+    });
+  } catch (error) {
+    // The insert can succeed even if its response is lost. Verify it before rolling back photos.
+    const saved = await remote<Pick<Star, 'id'>[]>('stars?id=eq.' + star.id + '&select=id&limit=1').catch(() => null);
+    if (saved?.length) return;
+    if (saved) await removeMemories(paths);
+    else if (paths.length) console.error('Could not verify the save for star', star.id);
+    throw error;
+  }
 }
 
 export async function createStar(input: Record<string, unknown>) {
@@ -111,37 +126,72 @@ export async function createStar(input: Record<string, unknown>) {
     x, y, created: new Date().toISOString(), owner_hash: hash(owner), access_hash: access ? hash(access) : null
   };
   if (hosted()) {
-    const record = photos.length ? { ...star, photos } : star;
-    await remote('stars', { method: 'POST', headers: { Prefer: 'return=minimal' }, body: JSON.stringify(record) });
+    await saveHostedStar(star, photos);
   } else {
     const db = await database();
     db.prepare(`INSERT INTO stars (id,title,note,author,tags,color,visibility,x,y,created,owner_hash,access_hash,photos)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(star.id, star.title, star.note, star.author, star.tags,
-      star.color, star.visibility, star.x, star.y, star.created, star.owner_hash, star.access_hash, JSON.stringify(photos));
+      star.color, star.visibility, star.x, star.y, star.created, star.owner_hash, star.access_hash,
+      JSON.stringify(photos.map((photo) => photo.encoded)));
   }
   return { id: star.id, title: star.title, author: star.author, color, tags: star.tags, visibility, x, y, created: star.created, owner, access };
 }
 
 async function load(id: string): Promise<Star | undefined> {
   if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(id)) return;
-  if (hosted()) return (await remote<Star[]>('stars?id=eq.' + id + '&limit=1'))[0];
-  return (await database()).prepare('SELECT * FROM stars WHERE id = ?').get(id) as Star | undefined;
+  if (hosted()) return (await remote<Star[]>('stars?id=eq.' + id + '&limit=1&select=' + detailFields))[0];
+  return (await database()).prepare('SELECT ' + detailFields + ' FROM stars WHERE id = ?').get(id) as Star | undefined;
 }
 
-export async function readStar(id: string, owner: string | null, access: string | null) {
+async function readableStar(id: string, owner: string | null, access: string | null) {
   const star = await load(id);
   if (!star) return null;
   const canDelete = matches(owner, star.owner_hash);
   if (star.visibility === 'private' && !canDelete && !matches(access, star.access_hash)) return null;
+  return { star, canDelete };
+}
+
+function storedPhotos(value: Star['photos']): string[] {
+  const photos: unknown = typeof value === 'string' ? JSON.parse(value) : value;
+  return Array.isArray(photos) ? photos.slice(0, maxStarPhotos).filter((item) => typeof item === 'string') : [];
+}
+
+export async function readStar(id: string, owner: string | null, access: string | null) {
+  const result = await readableStar(id, owner, access);
+  if (!result) return null;
+  const { star, canDelete } = result;
   const { owner_hash: _owner, access_hash: _access, photos, ...message } = star;
-  return { ...message, photos: typeof photos === 'string' ? JSON.parse(photos) : photos ?? [], canDelete };
+  return { ...message, photoCount: storedPhotos(photos).length, canDelete };
+}
+
+export async function readStarPhoto(id: string, index: number, owner: string | null, access: string | null) {
+  const result = await readableStar(id, owner, access);
+  const reference = result && storedPhotos(result.star.photos)[index];
+  if (!reference) return null;
+
+  const type = memoryType(id, reference);
+  if (type) {
+    if (!hosted()) return null;
+    const body = await downloadMemory(reference);
+    return body ? { type, body } : null;
+  }
+
+  // SQLite photos and older Supabase rows store base64 images.
+  const legacy = decodePhoto(reference);
+  return legacy ? { type: photoTypes[legacy.extension], body: new Uint8Array(legacy.bytes) } : null;
 }
 
 export async function deleteStar(id: string, owner: string | null) {
   const star = await load(id);
   if (!star || !matches(owner, star.owner_hash)) return false;
-  if (hosted()) await remote('stars?id=eq.' + id + '&owner_hash=eq.' + star.owner_hash, { method: 'DELETE' });
-  else (await database()).prepare('DELETE FROM stars WHERE id = ? AND owner_hash = ?').run(id, star.owner_hash);
+  if (hosted()) {
+    const deleted = await remote<Pick<Star, 'id'>[]>('stars?id=eq.' + id + '&owner_hash=eq.' + star.owner_hash + '&select=id', {
+      method: 'DELETE', headers: { Prefer: 'return=representation' }
+    });
+    if (deleted.length) await removeMemories(storedPhotos(star.photos).filter((path) => memoryType(id, path)));
+  } else {
+    (await database()).prepare('DELETE FROM stars WHERE id = ? AND owner_hash = ?').run(id, star.owner_hash);
+  }
   return true;
 }
 

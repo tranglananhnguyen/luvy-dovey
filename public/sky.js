@@ -30,6 +30,7 @@
   let current;
   let readerFocus;
   let readerRequest;
+  let readerPhotoRequest;
   let readerAnimation;
   let readerClosing = false;
   let drag;
@@ -43,10 +44,10 @@
   const screen = (star) => ({ x: star.x - camera.x + width() / 2, y: star.y - camera.y + height() / 2 });
   const toWorld = (x, y) => ({ x: clamp(x + camera.x - width() / 2, world.x), y: clamp(y + camera.y - height() / 2, world.y) });
 
-  function tell(message) {
+  function tell(message, persistent = false) {
     $('#status').textContent = message;
     clearTimeout(temporaryStatus);
-    temporaryStatus = setTimeout(() => { $('#status').textContent = ''; }, 5500);
+    if (!persistent) temporaryStatus = setTimeout(() => { $('#status').textContent = ''; }, 5500);
   }
 
   function remember() {
@@ -58,8 +59,13 @@
 
   async function api(suffix = '', options) {
     const response = await fetch('/api/stars' + suffix, options);
+    if (!response.ok) {
+      const data = await response.json().catch(() => null);
+      throw new Error(data?.error || (response.status === 413
+        ? 'These photos are too large to send.'
+        : 'The sky is temporarily unavailable. Please try again.'));
+    }
     const data = await response.json();
-    if (!response.ok) throw new Error(data.error);
     return data;
   }
 
@@ -629,6 +635,7 @@
     const submitted = draft;
     saving = true;
     $('#center').disabled = $('#cancel').disabled = true;
+    tell(submitted.photos.length ? 'Saving your wish and photos…' : 'Saving your wish…', true);
     try {
       const { owner, access, ...star } = await api('', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...submitted, ...point })
@@ -669,11 +676,11 @@
     starMessages.set(message.id, message);
   }
 
-  function photoImage(data, alt) {
+  function photoImage(src, alt) {
     const image = new Image();
     image.alt = alt;
     image.decoding = 'async';
-    image.src = 'data:image/jpeg;base64,' + data;
+    if (src) image.src = src;
     return image;
   }
 
@@ -681,14 +688,46 @@
   const readerStatus = $('#read-status');
   const readerMessage = $('#read-message');
 
+  function showStarPhotos(star) {
+    if (star.photos) {
+      readerPhotos.replaceChildren(...star.photos.map((photo, index) =>
+        photoImage('data:image/jpeg;base64,' + photo, 'Attached photo ' + (index + 1))));
+      readerPhotos.hidden = !star.photos.length;
+      return;
+    }
+
+    readerPhotos.hidden = !star.photoCount;
+    if (!star.photoCount) return;
+    const request = new AbortController();
+    readerPhotoRequest = request;
+    const { signal } = request;
+    const headers = credentials(star);
+    for (let index = 0; index < star.photoCount; index++) {
+      const image = photoImage(null, 'Attached photo ' + (index + 1));
+      image.hidden = true;
+      readerPhotos.append(image);
+      fetch('/api/stars/' + star.id + '/photos/' + index, { headers, signal })
+        .then(async (response) => {
+          if (!response.ok) throw new Error('Photo unavailable.');
+          const blob = await response.blob();
+          if (signal.aborted) return;
+          const url = URL.createObjectURL(blob);
+          signal.addEventListener('abort', () => URL.revokeObjectURL(url), { once: true });
+          image.src = url;
+          image.hidden = false;
+        }).catch(() => {
+          if (signal.aborted) return;
+          image.remove();
+          readerStatus.textContent = 'Some photos couldn’t be opened.';
+        });
+    }
+  }
+
   function showStarMessage(message, access) {
     current = { ...message, access };
     reader.dataset.color = current.color;
     $('#read-title').textContent = current.title;
     $('#read-note').textContent = current.note;
-    const photos = current.photos ?? [];
-    readerPhotos.replaceChildren(...photos.map((photo, index) => photoImage(photo, 'Attached photo ' + (index + 1))));
-    readerPhotos.hidden = !photos.length;
     $('#read-author').textContent = current.author ? 'Left by ' + current.author : '';
     $('#read-date').dateTime = current.created;
     $('#read-date').textContent = new Date(current.created).toLocaleDateString(undefined, { dateStyle: 'long' });
@@ -698,6 +737,7 @@
     $('#delete').textContent = 'Delete star';
     readerStatus.textContent = '';
     readerMessage.hidden = false;
+    showStarPhotos(current);
   }
 
   function showReader() {
@@ -776,6 +816,8 @@
   reader.addEventListener('close', () => {
     readerRequest?.abort();
     readerRequest = undefined;
+    readerPhotoRequest?.abort();
+    readerPhotoRequest = undefined;
     readerAnimation?.cancel();
     readerAnimation = undefined;
     readerClosing = false;
@@ -1085,6 +1127,7 @@
   const maxPhotos = Number(photoFiles.dataset.maxCount);
   const maxPhotoEdge = Number(photoFiles.dataset.maxEdge);
   const maxPhotoLength = Number(photoFiles.dataset.maxLength);
+  const maxSourcePhotoBytes = Number(photoFiles.dataset.maxSourceBytes);
   const wishPhotos = [];
   let preparingPhotos = false;
 
@@ -1102,7 +1145,7 @@
         renderWishPhotos();
         photoPicker.focus();
       });
-      tile.append(photoImage(photo, 'Selected photo ' + (index + 1)), remove);
+      tile.append(photoImage('data:image/jpeg;base64,' + photo, 'Selected photo ' + (index + 1)), remove);
       return tile;
     }));
     photoPreviews.hidden = !wishPhotos.length;
@@ -1111,9 +1154,14 @@
   }
 
   async function prepareWishPhoto(file) {
-    if (file.size > 25 * 1024 * 1024) throw new Error('Choose a photo smaller than 25 MB.');
-    if ((file.type && !file.type.startsWith('image/')) || file.type === 'image/svg+xml') {
-      throw new Error('Choose a photo such as a JPG, PNG, or WebP.');
+    if (file.size > maxSourcePhotoBytes) throw new Error('Each photo must be 5 MB or smaller.');
+    const signature = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+    const jpeg = signature[0] === 0xff && signature[1] === 0xd8;
+    const png = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a].every((byte, index) => signature[index] === byte);
+    const webp = String.fromCharCode(...signature.slice(0, 4)) === 'RIFF' &&
+      String.fromCharCode(...signature.slice(8, 12)) === 'WEBP';
+    if (!jpeg && !png && !webp) {
+      throw new Error('Choose a JPG, PNG, or WebP photo.');
     }
     const source = URL.createObjectURL(file);
     try {

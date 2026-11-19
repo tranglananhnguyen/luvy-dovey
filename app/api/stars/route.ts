@@ -1,4 +1,4 @@
-import { createStar, listStars, response, unavailable } from '../../../lib/stars';
+import { createStar, listStars, PhotoUploadError, response, unavailable } from '../../../lib/stars';
 import { maxStarBodyBytes } from '../../../lib/star-photos';
 
 export const runtime = 'nodejs';
@@ -43,5 +43,11 @@ export async function POST(request: Request) {
   try {
     const star = await createStar(input);
     return star ? response(star, 201) : response({ error: 'Check your title, message, photos, and star placement.' }, 400);
-  } catch (error) { return unavailable(error); }
+  } catch (error) {
+    if (error instanceof PhotoUploadError) {
+      console.error(error);
+      return response({ error: 'Your photos couldn’t be saved. Try placing your star again.' }, 503);
+    }
+    return unavailable(error);
+  }
 }

@@ -1,6 +1,6 @@
 import Script from 'next/script';
 import { planets } from '../lib/star-options';
-import { maxPhotoEdge, maxPhotoLength, maxStarPhotos } from '../lib/star-photos';
+import { maxPhotoEdge, maxPhotoLength, maxSourcePhotoBytes, maxStarPhotos } from '../lib/star-photos';
 
 function BotanicalFrame() {
   return <div className="wish-vines" aria-hidden="true"><span /><span /></div>;
@@ -161,8 +161,9 @@ export default function Home() {
                 <span className="photo-drop-hint">Browse files or gallery</span>
               </button>
             </div>
-            <input type="file" id="wish-photos" accept="image/*" multiple hidden
-              data-max-count={maxStarPhotos} data-max-edge={maxPhotoEdge} data-max-length={maxPhotoLength} />
+            <input type="file" id="wish-photos" accept="image/jpeg,image/png,image/webp" multiple hidden
+              data-max-count={maxStarPhotos} data-max-edge={maxPhotoEdge} data-max-length={maxPhotoLength}
+              data-max-source-bytes={maxSourcePhotoBytes} />
             <p className="photo-help" id="wish-photos-help">Anyone who opens your star can see its photos.</p>
             <p className="field-error" id="wish-photos-feedback" role="status"></p>
             <div id="wish-photo-previews" role="group" aria-label="Selected photos" hidden />
