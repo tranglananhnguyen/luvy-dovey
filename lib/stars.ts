@@ -1,15 +1,25 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
+import { planets } from './star-options';
+import { readPhotoInput } from './star-photos';
 
 const summaryFields = 'id,title,author,color,tags,x,y';
 const world = { x: 2400, y: 1600 };
-const colors = ['white', 'gold', 'pink', 'lavender', 'blue'];
+const colors = new Set<string>(['white', 'gold', 'pink', 'lavender', 'blue', ...planets.map((planet) => planet.color)]);
 type Star = {
   id: string; title: string; note: string; author: string; color: string; tags: string;
   visibility: 'public' | 'private'; x: number; y: number; created: string;
   owner_hash: string | null; access_hash: string | null;
+  photos?: string[] | string;
 };
+
+const localStarTable = `CREATE TABLE IF NOT EXISTS stars (
+  id TEXT PRIMARY KEY, title TEXT NOT NULL, note TEXT NOT NULL, author TEXT NOT NULL,
+  color TEXT NOT NULL, tags TEXT NOT NULL, visibility TEXT NOT NULL,
+  x REAL NOT NULL, y REAL NOT NULL, created TEXT NOT NULL, owner_hash TEXT, access_hash TEXT,
+  photos TEXT NOT NULL DEFAULT '[]'
+);`;
 
 let local: Promise<DatabaseSync> | undefined;
 function database() {
@@ -17,25 +27,19 @@ function database() {
     const directory = process.env.DATA_DIR || 'data';
     mkdirSync(directory, { recursive: true });
     const db = new DatabaseSync(directory + '/sky.sqlite');
-    db.exec(`PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;
-      CREATE TABLE IF NOT EXISTS stars (
-        id TEXT PRIMARY KEY, title TEXT NOT NULL, note TEXT NOT NULL, author TEXT NOT NULL,
-        color TEXT NOT NULL, tags TEXT NOT NULL, visibility TEXT NOT NULL,
-        x REAL NOT NULL, y REAL NOT NULL, created TEXT NOT NULL, owner_hash TEXT, access_hash TEXT
-      );`);
+    db.exec(`PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; ${localStarTable}`);
     const columns = db.prepare('PRAGMA table_info(stars)').all();
     if (columns.some((column) => column.name === 'kind')) {
       db.exec(`BEGIN IMMEDIATE;
         ALTER TABLE stars RENAME TO legacy_stars;
-        CREATE TABLE stars (
-          id TEXT PRIMARY KEY, title TEXT NOT NULL, note TEXT NOT NULL, author TEXT NOT NULL,
-          color TEXT NOT NULL, tags TEXT NOT NULL, visibility TEXT NOT NULL,
-          x REAL NOT NULL, y REAL NOT NULL, created TEXT NOT NULL, owner_hash TEXT, access_hash TEXT
-        );
-        INSERT INTO stars SELECT id,title,note,author,CASE kind WHEN 'wish' THEN 'pink' ELSE 'blue' END,
+        ${localStarTable}
+        INSERT INTO stars (id,title,note,author,color,tags,visibility,x,y,created,owner_hash,access_hash)
+          SELECT id,title,note,author,CASE kind WHEN 'wish' THEN 'pink' ELSE 'blue' END,
           '', 'public', x * 24, y * 16, created, NULL, NULL FROM legacy_stars;
         DROP TABLE legacy_stars;
         COMMIT;`);
+    } else if (!columns.some((column) => column.name === 'photos')) {
+      db.exec("ALTER TABLE stars ADD COLUMN photos TEXT NOT NULL DEFAULT '[]'");
     }
     return db;
   });
@@ -87,9 +91,14 @@ function textField(input: unknown, max: number, required = false) {
 }
 
 export async function createStar(input: Record<string, unknown>) {
-  const { title, note, author, tags, color, visibility, x, y } = input;
-  if (!textField(title, 80, true) || !textField(note, 2000, true) || !textField(author, 40) ||
-      !textField(tags, 160) || typeof color !== 'string' || !colors.includes(color) ||
+  const { title, note, author, visibility, x, y } = input;
+  const planet = planets.find((option) => option.name === input.planet);
+  const tags = planet?.name ?? input.tags;
+  const color = planet?.color ?? input.color;
+  const photos = readPhotoInput(input.photos);
+  if (!photos || (input.planet !== undefined && !planet) ||
+      !textField(title, 80, true) || !textField(note, 2000, true) || !textField(author, 40) ||
+      !textField(tags, 160) || typeof color !== 'string' || !colors.has(color) ||
       (visibility !== 'public' && visibility !== 'private') ||
       typeof x !== 'number' || !Number.isFinite(x) || x < 0 || x > world.x ||
       typeof y !== 'number' || !Number.isFinite(y) || y < 0 || y > world.y || input.website !== '') return null;
@@ -102,14 +111,15 @@ export async function createStar(input: Record<string, unknown>) {
     x, y, created: new Date().toISOString(), owner_hash: hash(owner), access_hash: access ? hash(access) : null
   };
   if (hosted()) {
-    await remote('stars', { method: 'POST', headers: { Prefer: 'return=minimal' }, body: JSON.stringify(star) });
+    const record = photos.length ? { ...star, photos } : star;
+    await remote('stars', { method: 'POST', headers: { Prefer: 'return=minimal' }, body: JSON.stringify(record) });
   } else {
     const db = await database();
-    db.prepare(`INSERT INTO stars (id,title,note,author,tags,color,visibility,x,y,created,owner_hash,access_hash)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(star.id, star.title, star.note, star.author, star.tags,
-      star.color, star.visibility, star.x, star.y, star.created, star.owner_hash, star.access_hash);
+    db.prepare(`INSERT INTO stars (id,title,note,author,tags,color,visibility,x,y,created,owner_hash,access_hash,photos)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(star.id, star.title, star.note, star.author, star.tags,
+      star.color, star.visibility, star.x, star.y, star.created, star.owner_hash, star.access_hash, JSON.stringify(photos));
   }
-  return { id: star.id, title: star.title, author: star.author, color, tags: star.tags, visibility, x, y, owner, access };
+  return { id: star.id, title: star.title, author: star.author, color, tags: star.tags, visibility, x, y, created: star.created, owner, access };
 }
 
 async function load(id: string): Promise<Star | undefined> {
@@ -123,8 +133,8 @@ export async function readStar(id: string, owner: string | null, access: string 
   if (!star) return null;
   const canDelete = matches(owner, star.owner_hash);
   if (star.visibility === 'private' && !canDelete && !matches(access, star.access_hash)) return null;
-  const { owner_hash: _owner, access_hash: _access, ...message } = star;
-  return { ...message, canDelete };
+  const { owner_hash: _owner, access_hash: _access, photos, ...message } = star;
+  return { ...message, photos: typeof photos === 'string' ? JSON.parse(photos) : photos ?? [], canDelete };
 }
 
 export async function deleteStar(id: string, owner: string | null) {

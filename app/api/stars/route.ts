@@ -1,4 +1,5 @@
 import { createStar, listStars, response, unavailable } from '../../../lib/stars';
+import { maxStarBodyBytes } from '../../../lib/star-photos';
 
 export const runtime = 'nodejs';
 const attempts = new Map<string, { count: number; expires: number }>();
@@ -30,7 +31,7 @@ export async function POST(request: Request) {
       const { value, done } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > 16_384) {
+      if (size > maxStarBodyBytes) {
         await reader.cancel();
         return response({ error: 'This star is too large.' }, 413);
       }
@@ -41,6 +42,6 @@ export async function POST(request: Request) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return response({ error: 'Invalid star.' }, 400);
   try {
     const star = await createStar(input);
-    return star ? response(star, 201) : response({ error: 'Check your title, message, and star placement.' }, 400);
+    return star ? response(star, 201) : response({ error: 'Check your title, message, photos, and star placement.' }, 400);
   } catch (error) { return unavailable(error); }
 }

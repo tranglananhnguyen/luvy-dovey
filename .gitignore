@@ -5,3 +5,4 @@
 !/.env.example
 /next-env.d.ts
 *.tsbuildinfo
+/public/fonts/starlight-rune-personal-use.ttf

@@ -12,6 +12,7 @@ create table if not exists public.stars (
   owner_hash text,
   access_hash text
 );
+alter table public.stars add column if not exists photos jsonb not null default '[]'::jsonb;
 create index if not exists public_stars_created on public.stars (created desc) where visibility = 'public';
 alter table public.stars enable row level security;
 revoke all on public.stars from public, anon, authenticated;
