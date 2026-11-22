@@ -15,6 +15,8 @@ Open http://localhost:3000. For a local production check, run `npm run build` fo
 
 The repository uses Cormorant Infant by default. If you have permission to use a Starlight Rune font file in your environment, you can place it at `public/fonts/starlight-rune-personal-use.ttf` before starting or building the app. That file is excluded from Git.
 
+To supply Starlight Rune through Vercel, set `STARLIGHT_RUNE_BASE64` in the **Production** environment to the base64-encoded contents of the TrueType file. Redeploy after saving it. The build serves the font to visitors without adding the font file to GitHub.
+
 ## Put the shared sky online
 
 1. In Supabase, open **SQL Editor** and run [supabase/schema.sql](supabase/schema.sql) if you have not already. In **Storage**, select the existing `memories` bucket and confirm it is **private**. In its settings, allow JPEG, PNG and WebP (`image/jpeg`, `image/png`, `image/webp`) and set the per-file limit to 5 MB.
